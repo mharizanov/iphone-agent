@@ -129,7 +129,7 @@ It lives in `lib/iphone_mcp.py` and uses the Python MCP SDK 2.2.0 (`mcp.server.m
 - **Not yet tested live:** starting and idle-stopping the agent on USB (the phone was only on Wi-Fi). `claude mcp list` health checks do not start the agent (verified).
 
 ## mobile-mcp (third-party; unregistered 2026-09-30, replaced by `iphone`)
-Pinned to 1.0.5 (mobilecli 1.0.13) in `config/iphone.env`, and registered by `scripts/setup --mcp`.
+Tested at 1.0.5 (mobilecli 1.0.13). No longer pinned or registered by this repo.
 
 **Live result, 2026-09-30:**
 - `launch_app` works.

@@ -24,7 +24,7 @@
 #   - every stop/WDA restart kills the runner on the phone (ios kill) and the
 #     script runs with job control, so Ctrl-C can't orphan WDA on Wi-Fi
 #
-# 2026-09-30: portable — all settings in config/iphone.env, state in var/,
+# 2026-09-30: portable — settings in config/local.env + config/iphone.env, state in var/,
 # pinned go-ios from scripts/setup (see README.md)
 #
 # One-time prerequisites (see README.md):
@@ -32,7 +32,7 @@
 #   - Developer Mode on, Mac trusted, phone on USB (direct Mac port beats
 #     a monitor's USB hub — such hubs drop the phone after long locks).
 
-# config/iphone.env + repo paths (var/log, var/devimages, pinned go-ios)
+# config/local.env + config/iphone.env + repo paths (var/log, var/devimages, pinned go-ios)
 # $0 may be a symlink (/usr/local/bin/iphone-agent) — resolve it first
 _self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
   case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done

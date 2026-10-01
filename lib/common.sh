@@ -1,6 +1,6 @@
 # Shared setup for all iphone-agent scripts. Source it; do not execute.
 # Resolves the repo root (through symlinks such as /usr/local/bin/iphone-agent),
-# loads config/iphone.env and points every tool at repo-local state in var/.
+# loads config/local.env + config/iphone.env and points every tool at repo-local state in var/.
 
 _src="${BASH_SOURCE[1]:-$0}"
 while [ -L "$_src" ]; do
@@ -53,7 +53,7 @@ resolve_udid() {
   case "$(printf '%s' "$ids" | grep -c .)" in
     1) IPHONE_UDID="$ids" ;;
     0) echo "no iPhone on USB" >&2; return 1 ;;
-    *) echo "several iPhones attached — set IPHONE_UDID in config/iphone.env:" >&2
+    *) echo "several iPhones attached — set IPHONE_UDID in config/local.env:" >&2
        echo "$ids" >&2; return 1 ;;
   esac
 }

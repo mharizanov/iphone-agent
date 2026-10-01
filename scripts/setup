@@ -6,7 +6,8 @@
 #   scripts/setup --mcp      also (re-)register this repo's MCP server 'iphone' in Claude Code, user scope
 #
 # Everything installed lives in var/ (gitignored). Versions are pinned in
-# config/iphone.env. Manual one-time steps are printed at the end.
+# config/iphone.env; your own values go in config/local.env. Manual one-time
+# steps are printed at the end.
 
 _self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
   case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
@@ -118,7 +119,8 @@ cat <<EOF
 
 manual one-time steps (not scriptable):
   Mac    Xcode → Settings → Accounts → add your Apple ID; put its Team ID in
-         config/iphone.env (DEVELOPMENT_TEAM) and pick a unique WDA_BUNDLE_PREFIX
+         config/local.env (DEVELOPMENT_TEAM) and pick a unique WDA_BUNDLE_PREFIX
+         (cp config/local.env.example config/local.env)
   phone  connect by USB, tap "Trust This Computer"
   phone  Settings → Privacy & Security → Developer Mode → on (phone reboots)
   Mac    scripts/wda-resign; on the first run the phone asks to trust the

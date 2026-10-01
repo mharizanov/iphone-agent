@@ -4,7 +4,7 @@
 # Phone on USB and UNLOCKED.
 #
 # Builds var/WebDriverAgent (pinned upstream clone from scripts/setup) with
-# DEVELOPMENT_TEAM and the bundle id from config/iphone.env passed on the
+# DEVELOPMENT_TEAM and the bundle id from config/local.env passed on the
 # command line — the upstream project stays unmodified. Runs WDA once and stops
 # as soon as it prints ServerURLHere. Then start `iphone-agent`.
 #
