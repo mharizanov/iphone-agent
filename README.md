@@ -118,3 +118,6 @@ Coordinates are points. The x,y column of `wda texts` gives each element's centr
 | `docs/NOTES.md` | how the stack behaves: traps, measurements, security findings, open checks |
 | `CLAUDE.md` | instructions for an agent driving the phone |
 | `var/` | created by setup, git-ignored: `bin/ios`, `bin/ocr`, `WebDriverAgent/`, `venv/`, `devimages/`, `log/` |
+
+## License
+MIT, see `LICENSE`. It covers this repo only: WebDriverAgent (BSD), go-ios (MIT) and the Python MCP SDK (MIT) are downloaded by `scripts/setup` under their own licenses.
