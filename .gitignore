@@ -1,0 +1,11 @@
+.DS_Store
+*.log
+*.png
+*.bak*
+# pinned deps, logs, caches, session state (scripts/setup)
+var/
+# go-ios host pairing identity (private key) — written to the cwd
+selfIdentity.plist
+__pycache__/
+# personal values (UDID, team, bundle prefix, local labels)
+config/local.env

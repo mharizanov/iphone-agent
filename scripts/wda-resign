@@ -1,0 +1,56 @@
+#!/bin/bash
+# wda-resign — build, sign and install WebDriverAgent on the phone. Needed
+# once after scripts/setup and then every 7 days on a free Apple ID.
+# Phone on USB and UNLOCKED.
+#
+# Builds var/WebDriverAgent (pinned upstream clone from scripts/setup) with
+# DEVELOPMENT_TEAM and the bundle id from config/iphone.env passed on the
+# command line — the upstream project stays unmodified. Runs WDA once and stops
+# as soon as it prints ServerURLHere. Then start `iphone-agent`.
+#
+# Known stalls (2026-09-30):
+#   - "Device is busy (Preparing …)" after an iOS update — Xcode is building
+#     device support; wait a few minutes with the phone unlocked, retry.
+#   - "Developer App Certificate is not trusted" — a new cert needs a manual
+#     trust on the phone: Settings → General → VPN & Device Management →
+#     Developer App → <your Apple ID> → Trust. Then retry.
+
+_self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
+  case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
+. "$(dirname "$_self")/../lib/common.sh"
+
+set -u
+require_ios
+resolve_udid || exit 1
+[ -d "$WDA_SRC/WebDriverAgent.xcodeproj" ] || { echo "no WebDriverAgent at $WDA_SRC — run scripts/setup" >&2; exit 1; }
+[ -n "$DEVELOPMENT_TEAM" ] || { echo "set DEVELOPMENT_TEAM in config/local.env" >&2; exit 1; }
+case "$WDA_BUNDLE_PREFIX" in com.example.*) echo "set your own WDA_BUNDLE_PREFIX in config/local.env" >&2; exit 1 ;; esac
+
+LOG="$LOG_DIR/resign.log"
+: >"$LOG"
+
+cd "$WDA_SRC" || exit 1
+xcodebuild -project WebDriverAgent.xcodeproj -scheme WebDriverAgentRunner \
+  -destination "id=$IPHONE_UDID" -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+  PRODUCT_BUNDLE_IDENTIFIER="$WDA_BUNDLE_PREFIX" test >"$LOG" 2>&1 &
+XB=$!
+
+result=timeout
+for _ in $(seq 1 200); do
+  if grep -q "ServerURLHere" "$LOG"; then result=ok; break; fi
+  if grep -qE '\*\* TEST (FAILED|BUILD FAILED)|xcodebuild: error:' "$LOG"; then result=failed; break; fi
+  kill -0 "$XB" 2>/dev/null || { result=failed; break; }
+  sleep 3
+done
+{ kill "$XB"; wait "$XB"; } 2>/dev/null
+pkill -f "xcodebuild -project WebDriverAgent" 2>/dev/null
+
+case "$result" in
+  ok)
+    echo "WDA re-signed and installed ($WDA_BUNDLE_ID) — start iphone-agent" ;;
+  *)
+    echo "re-sign $result — log: $LOG" >&2
+    grep -E "error:|not trusted|busy|locked" "$LOG" | head -5 >&2
+    exit 1 ;;
+esac

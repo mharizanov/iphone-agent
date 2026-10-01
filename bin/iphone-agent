@@ -1,0 +1,346 @@
+#!/bin/bash
+# iphone-agent — supervised go-ios plumbing so an LLM agent can drive the iPhone.
+# Usage: iphone-agent          (start + auto-heal tunnel/forward/WDA, Ctrl-C to stop)
+#
+# v2 (2026-08-14): self-healing. The phone's 5-min auto-lock kills the
+# lockdown tunnel (framedIPv6Reader EOF) and with it WDA; an iOS update also
+# unmounts the developer disk image. The phone still has to be UNLOCKED for
+# WDA to come back — the agent just makes recovery automatic once it is.
+#
+# v3 (2026-09-30, audit fixes):
+#   - restart only what died: WDA alone is relaunched while tunnel + forward
+#     are alive; full chain only when those die or WDA fails twice in a row
+#   - exponential backoff (5 → 30 s) instead of a flat 10 s sleep
+#   - a WDA that keeps dying within 60 s (persistent zombie) backs off, then
+#     escalates to a full chain restart
+#   - liveness via cheap /status every 5 s (a hang/timeout counts as failure);
+#     the heavy authorization probe (/screenshot = HEIC→PNG→base64 at full
+#     res) runs every 30 s instead of every 5 s
+#   - DDI cache pinned to var/devimages (was relative to the cwd)
+#   - every go-ios call pinned to the UDID (phone is listed twice: USB + Wi-Fi)
+#   - refuses to forward if localhost:8100 is held by something else; no
+#     forward/WDA start when the tunnel never came up
+#   - persistent appended logs in var/log/
+#   - every stop/WDA restart kills the runner on the phone (ios kill) and the
+#     script runs with job control, so Ctrl-C can't orphan WDA on Wi-Fi
+#
+# 2026-09-30: portable — all settings in config/iphone.env, state in var/,
+# pinned go-ios from scripts/setup (see README.md)
+#
+# One-time prerequisites (see README.md):
+#   - scripts/setup, then scripts/wda-resign (re-sign weekly on a free Apple ID).
+#   - Developer Mode on, Mac trusted, phone on USB (direct Mac port beats
+#     a monitor's USB hub — such hubs drop the phone after long locks).
+
+# config/iphone.env + repo paths (var/log, var/devimages, pinned go-ios)
+# $0 may be a symlink (/usr/local/bin/iphone-agent) — resolve it first
+_self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
+  case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
+. "$(dirname "$_self")/../lib/common.sh"
+require_ios
+resolve_udid || exit 1
+UDID="$IPHONE_UDID"
+# go-ios writes its host pairing identity (selfIdentity.plist, with a private
+# key) into the current directory — keep it in var/, never in whatever repo
+# the agent happened to be started from
+cd "$VAR_DIR" || exit 1
+# /wda/activeAppInfo is session-less and far cheaper, but it is unverified
+# whether it fails in the de-authorized (locked-phone zombie) state — test
+# before switching (AUTH_PROBE=/wda/activeAppInfo iphone-agent).
+AUTH_PROBE="${AUTH_PROBE:-/screenshot}"
+AUTH_EVERY="${AUTH_EVERY:-30}"   # s between authorization probes
+POLL=5               # s between /status liveness checks
+LIVE_FAILS_MAX=4     # consecutive /status failures (5 s timeout each) = hung
+BACKOFF_MIN=5
+BACKOFF_MAX=30
+
+AGENT_LOG="$LOG_DIR/agent.log"
+TUNNEL_LOG="$LOG_DIR/tunnel.log"
+FORWARD_LOG="$LOG_DIR/forward.log"
+WDA_LOG="$LOG_DIR/runwda.log"
+
+set -u
+# Job control: each background job (go-ios, sleeps) gets its own process group,
+# so a terminal Ctrl-C (sent to the whole foreground group) reaches only this
+# script — cleanup then still has a live tunnel to kill WDA on the phone.
+# Without it, go-ios died with the agent and WDA stayed up on Wi-Fi.
+set -m
+for f in "$AGENT_LOG" "$TUNNEL_LOG" "$FORWARD_LOG" "$WDA_LOG"; do
+  # keep one rotation once a log passes 5 MB
+  [ -f "$f" ] && [ "$(stat -f %z "$f")" -gt 5242880 ] && mv -f "$f" "$f.1"
+done
+
+say() {
+  local msg="[$(date '+%F %T')] $*"
+  echo "$msg"
+  echo "$msg" >>"$AGENT_LOG"
+}
+
+TUNNEL_PID=
+FORWARD_PID=
+WDA_PID=
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+stop_pid() { [ -n "$1" ] && kill "$1" 2>/dev/null; }
+# sleep in the background + wait, so INT/TERM run cleanup immediately
+# instead of after the current sleep finishes
+nap() { sleep "$1" & wait $!; }
+
+# Killing `ios runwda` leaves WDA running on the phone for ~30-40 s (seen
+# 2026-09-30), still answering on its Wi-Fi address. Kill the runner app
+# explicitly while the tunnel is still up; give up after 8 s. The process is
+# named WebDriverAgentRunner-Runner — kill by bundle id says "process not found".
+kill_wda_app() {
+  local out
+  # foreground with a hard 8 s limit (perl alarm): polling a backgrounded,
+  # disowned job with kill -0 sees an unreaped zombie and waits the full 8 s
+  out=$(perl -e 'alarm shift; exec @ARGV' 8 \
+    "$IOS_BIN" kill --process=WebDriverAgentRunner-Runner --udid "$UDID" 2>&1)
+  printf '%s\n' "$out" >>"$AGENT_LOG"
+  # success = go-ios reports the kill, or that WDA is not running at all; a PID
+  # check is not enough, since a SIGKILLed-but-unreaped tunnel passes kill -0
+  printf '%s' "$out" | grep -qE '"msg":"killed"|"msg":"process not found"'
+}
+
+stop_wda() {
+  kill_wda_app
+  stop_pid "$WDA_PID"; WDA_PID=
+  pkill -f "$GOIOS_RUNWDA_RE" 2>/dev/null
+}
+
+stop_all() {
+  kill_wda_app
+  stop_pid "$WDA_PID"; stop_pid "$FORWARD_PID"; stop_pid "$TUNNEL_PID"
+  pkill -f "$GOIOS_RE" 2>/dev/null
+  TUNNEL_PID=; FORWARD_PID=; WDA_PID=
+}
+
+# go-ios tunnels need USB; with the phone on Wi-Fi only a temporary tunnel just
+# times out (~40 s). No ConnectionType in the output (older go-ios, the test
+# stub) counts as USB.
+on_usb() {
+  local d
+  d=$("$IOS_BIN" list --details 2>/dev/null)
+  printf '%s' "$d" | grep -q '"ConnectionType"' || return 0
+  printf '%s' "$d" | grep -q '"ConnectionType":"USB"'
+}
+
+cleanup() {
+  echo
+  say "stopping..."
+  trap - INT TERM
+  # A stop that kills the whole process tree (not just our group) takes go-ios
+  # down with us, leaving no tunnel for kill_wda_app — and WDA up on Wi-Fi for
+  # ~30 s. Bring a tunnel up just long enough to kill it.
+  if ! kill_wda_app && on_usb; then
+    pkill -f "$GOIOS_RE" 2>/dev/null
+    say "tunnel gone — temporary tunnel to stop WDA on the phone"
+    start_tunnel >/dev/null 2>&1 && kill_wda_app && say "WDA stopped on the phone"
+  fi
+  stop_all
+  exit 0
+}
+trap cleanup INT TERM
+
+# go-ios left behind by an agent that was killed outright (parent = launchd,
+# PPID 1) is ours to clean up; one with a live parent means another agent runs
+for _p in $(pgrep -f "$GOIOS_RE"); do
+  if [ "$(ps -o ppid= -p "$_p" | tr -d ' ')" = 1 ]; then
+    kill "$_p" 2>/dev/null && echo "killed orphaned go-ios (pid $_p)" >&2
+  fi
+done
+sleep 1
+if pgrep -f "$GOIOS_RE" >/dev/null 2>&1; then
+  echo "Another iphone-agent (or go-ios) instance is already running." >&2
+  echo "Stop it first: pkill -f '$GOIOS_RE'" >&2
+  exit 1
+fi
+
+backoff=$BACKOFF_MIN
+bump_backoff() {
+  backoff=$((backoff * 2))
+  [ "$backoff" -gt "$BACKOFF_MAX" ] && backoff=$BACKOFF_MAX
+}
+
+wait_for_device() {
+  local warned=0
+  until "$IOS_BIN" list 2>/dev/null | grep -q "\"$UDID\""; do
+    [ "$warned" = 0 ] && { say "iPhone $UDID not on USB — plug it in / reseat the cable (waiting)"; warned=1; }
+    nap 5
+  done
+}
+
+port_holder() {
+  lsof -nP -iTCP:"$WDA_PORT" -iTCP:"$WDA_MJPEG_PORT" -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR==2 {print $1 " (pid " $2 ")"}'
+}
+
+# runwda fails with "missing tunnel address" / "connection refused" if
+# launched before the tunnel has negotiated — wait until `ios tunnel ls`
+# lists it AND its userspace port actually accepts connections
+start_tunnel() {
+  local port
+  "$IOS_BIN" tunnel start --udid "$UDID" --userspace >>"$TUNNEL_LOG" 2>&1 &
+  TUNNEL_PID=$!
+  disown "$TUNNEL_PID"   # no job-control notices; PID tracking unaffected
+  for _ in $(seq 1 15); do
+    alive "$TUNNEL_PID" || return 1
+    port=$("$IOS_BIN" tunnel ls 2>/dev/null | sed -n 's/.*"userspaceTunPort":\([0-9]*\).*/\1/p' | head -1)
+    if [ -n "$port" ] && nc -z 127.0.0.1 "$port" 2>/dev/null; then
+      nap 1
+      return 0
+    fi
+    nap 2
+  done
+  return 1
+}
+
+start_forward() {
+  local holder
+  holder=$(port_holder)
+  if [ -n "$holder" ]; then
+    say "localhost:$WDA_PORT/$WDA_MJPEG_PORT is already held by $holder — free it"
+    return 1
+  fi
+  # one process forwards both WDA's HTTP port and its MJPEG screenshot stream
+  "$IOS_BIN" forward --udid "$UDID" --port="$WDA_PORT:$WDA_PORT" \
+    --port="$WDA_MJPEG_PORT:$WDA_MJPEG_PORT" >>"$FORWARD_LOG" 2>&1 &
+  FORWARD_PID=$!
+  disown "$FORWARD_PID"   # no job-control notices; PID tracking unaffected
+  for _ in 1 2 3 4 5; do
+    alive "$FORWARD_PID" || return 1
+    [ -n "$(port_holder)" ] && return 0
+    nap 1
+  done
+  return 1
+}
+
+wda_live() { curl -s --max-time 5 "localhost:$WDA_PORT/status" 2>/dev/null | grep -q '"ready"'; }
+
+# empty output (timeout, reset) is a failure too, not just an error body
+wda_authorized() {
+  local head
+  head=$(curl -s --max-time 10 "localhost:$WDA_PORT$AUTH_PROBE" 2>/dev/null | head -c 300)
+  [ -n "$head" ] && ! printf '%s' "$head" | grep -q '"error"'
+}
+
+# a locked phone stalls here or makes runwda exit
+start_wda() {
+  # No USE_IP binding: passing `--env USE_IP=…` (127.0.0.1 or even 0.0.0.0)
+  # keeps WDA from coming up at all (2026-09-30), so WDA listens on every
+  # interface incl. the phone's Wi-Fi address while it runs.
+  "$IOS_BIN" runwda --udid "$UDID" \
+    --bundleid "$WDA_BUNDLE_ID" \
+    --testrunnerbundleid "$WDA_BUNDLE_ID" \
+    --xctestconfig WebDriverAgentRunner.xctest >>"$WDA_LOG" 2>&1 &
+  WDA_PID=$!
+  disown "$WDA_PID"   # no job-control notices; PID tracking unaffected
+  for _ in $(seq 1 20); do
+    wda_live && return 0
+    alive "$WDA_PID" || return 1
+    nap 3
+  done
+  wda_live
+}
+
+# Returns when WDA needs a restart: process exited, hung (no /status answer),
+# or de-authorized — a lock can leave WDA alive but refusing UI actions
+# ("Not authorized for performing UI testing actions").
+supervise_wda() {
+  local live_fails=0 auth_fails=0 last_auth=$SECONDS
+  while alive "$TUNNEL_PID" && alive "$FORWARD_PID" && alive "$WDA_PID"; do
+    if wda_live; then live_fails=0; else live_fails=$((live_fails + 1)); fi
+    if [ "$live_fails" -ge "$LIVE_FAILS_MAX" ]; then
+      say "WDA not answering /status ($live_fails checks) — hung"
+      return
+    fi
+    if [ $((SECONDS - last_auth)) -ge "$AUTH_EVERY" ]; then
+      last_auth=$SECONDS
+      if wda_authorized; then
+        auth_fails=0
+      else
+        auth_fails=$((auth_fails + 1))
+        # confirm on the next poll instead of waiting a full AUTH_EVERY
+        last_auth=$((SECONDS - AUTH_EVERY + POLL))
+      fi
+      if [ "$auth_fails" -ge 2 ]; then
+        say "WDA fails $AUTH_PROBE (de-authorized locked-phone zombie, or hung)"
+        return
+      fi
+    fi
+    nap "$POLL"
+  done
+  alive "$WDA_PID" || say "WDA process exited"
+}
+
+say "logs: $LOG_DIR"
+cycle=0
+short_lived=0
+while true; do
+  cycle=$((cycle + 1))
+  wait_for_device
+
+  # iOS updates/reboots unmount the personalized developer disk image, which
+  # makes runwda fail with "testmanagerd.remote is not available in RSD".
+  say "checking developer disk image (cycle $cycle)"
+  "$IOS_BIN" image auto --udid "$UDID" --basedir "$DDI_DIR" >>"$AGENT_LOG" 2>&1 \
+    || say "ios image auto failed — see $AGENT_LOG"
+
+  say "starting tunnel"
+  if ! start_tunnel; then
+    say "tunnel did not come up — full restart in ${backoff}s"
+    stop_all; nap "$backoff"; bump_backoff; continue
+  fi
+  say "starting port-forward $WDA_PORT"
+  if ! start_forward; then
+    say "port-forward did not come up — full restart in ${backoff}s"
+    stop_all; nap "$backoff"; bump_backoff; continue
+  fi
+
+  # tunnel + forward stay up; only WDA is recycled while they live
+  wda_fails=0
+  reason="tunnel or port-forward died (locked phone or USB drop?)"
+  while alive "$TUNNEL_PID" && alive "$FORWARD_PID"; do
+    say "starting WDA"
+    if start_wda; then
+      say "WDA ready on localhost:$WDA_PORT"
+      wda_fails=0
+      up_since=$SECONDS
+      supervise_wda
+      stop_wda
+      lived=$((SECONDS - up_since))
+      if [ "$lived" -ge 60 ]; then
+        short_lived=0
+        backoff=$BACKOFF_MIN
+      fi
+      # tunnel/forward died (screen lock, USB drop): the outer loop restarts it all
+      alive "$TUNNEL_PID" && alive "$FORWARD_PID" || continue
+      # a WDA that dies within a minute again and again (persistent zombie)
+      # gets backoff, and after the second time a full chain restart
+      if [ "$lived" -lt 60 ]; then
+        short_lived=$((short_lived + 1))
+        if [ "$short_lived" -ge 2 ]; then
+          reason="WDA died within 60 s $short_lived times in a row"
+          short_lived=0
+          break
+        fi
+        say "restarting WDA only in ${backoff}s"
+        nap "$backoff"; bump_backoff
+      else
+        say "restarting WDA only"
+      fi
+      continue
+    fi
+    wda_fails=$((wda_fails + 1))
+    say "WDA did not come up (attempt $wda_fails) — phone locked, image stale, or WDA needs its weekly re-sign (scripts/wda-resign)"
+    tail -50 "$WDA_LOG" | grep -o '"error":"[^"]*"' | tail -1 | cut -c1-200
+    stop_wda
+    if [ "$wda_fails" -ge 2 ]; then
+      reason="WDA failed $wda_fails times in a row"
+      break
+    fi
+    nap "$backoff"; bump_backoff
+  done
+  say "$reason — full restart in ${backoff}s"
+  stop_all
+  nap "$backoff"; bump_backoff
+done

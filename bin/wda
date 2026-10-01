@@ -1,0 +1,10 @@
+#!/bin/bash
+# wda — drive the iPhone through WebDriverAgent (logic in lib/wda.py).
+# Needs `iphone-agent` running (WDA on localhost:8100, MJPEG on :9100).
+# `wda help` lists the commands. Coordinates are POINTS, not screenshot pixels.
+
+_self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
+  case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
+. "$(dirname "$_self")/../lib/common.sh"
+export VAR_DIR WDA_URL WDA_MJPEG_PORT IOS_BIN
+exec python3 "$ROOT/lib/wda.py" "$@"

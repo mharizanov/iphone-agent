@@ -1,0 +1,128 @@
+#!/bin/bash
+# setup — make this checkout runnable on a Mac. Idempotent; re-run any time.
+#
+#   scripts/setup            check tools, install pinned go-ios + WebDriverAgent into var/
+#   scripts/setup --link     also symlink bin/iphone-agent and bin/wda into /usr/local/bin
+#   scripts/setup --mcp      also (re-)register this repo's MCP server 'iphone' in Claude Code, user scope
+#
+# Everything installed lives in var/ (gitignored). Versions are pinned in
+# config/iphone.env. Manual one-time steps are printed at the end.
+
+_self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
+  case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
+. "$(dirname "$_self")/../lib/common.sh"
+
+set -u
+LINK=0; MCP=0
+for a in "$@"; do
+  case "$a" in
+    --link) LINK=1 ;;
+    --mcp) MCP=1 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
+
+ok() { echo "  ✓ $*"; }
+fail() { echo "  ✗ $*" >&2; FAILED=1; }
+FAILED=0
+
+echo "tools"
+[ "$(uname -s)" = Darwin ] && ok "macOS $(sw_vers -productVersion)" || fail "macOS required"
+if xcodebuild -version >/dev/null 2>&1; then
+  ok "$(xcodebuild -version | head -1) ($(xcode-select -p))"
+else
+  fail "Xcode missing — install it from the App Store, then: sudo xcode-select -s /Applications/Xcode.app"
+fi
+for t in git curl unzip python3 lsof nc; do
+  command -v "$t" >/dev/null 2>&1 && ok "$t" || fail "$t missing"
+done
+[ "$FAILED" = 0 ] || exit 1
+
+mkdir -p "$VAR_DIR/bin"
+
+echo "go-ios $GO_IOS_VERSION"
+have=$("$VAR_DIR/bin/ios" --version 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' 2>/dev/null)
+if [ "$have" = "$GO_IOS_VERSION" ]; then
+  ok "already in var/bin/ios"
+else
+  tmp=$(mktemp -d)
+  if curl -fsSL -o "$tmp/go-ios.zip" \
+      "https://github.com/danielpaulus/go-ios/releases/download/v$GO_IOS_VERSION/go-ios-mac.zip" &&
+     unzip -q -o "$tmp/go-ios.zip" -d "$tmp" && install -m 755 "$tmp/ios" "$VAR_DIR/bin/ios"; then
+    ok "installed var/bin/ios"
+  else
+    fail "go-ios download failed"
+  fi
+  rm -rf "$tmp"
+fi
+
+echo "WebDriverAgent ${WDA_REF:0:12}"
+if [ ! -d "$WDA_SRC/.git" ]; then
+  git clone -q "$WDA_REPO" "$WDA_SRC" || fail "clone of $WDA_REPO failed"
+fi
+if [ -d "$WDA_SRC/.git" ]; then
+  if [ "$(git -C "$WDA_SRC" rev-parse HEAD)" != "$WDA_REF" ]; then
+    git -C "$WDA_SRC" fetch -q origin && git -C "$WDA_SRC" checkout -q "$WDA_REF" \
+      || fail "cannot check out $WDA_REF"
+  fi
+  if [ -n "$(git -C "$WDA_SRC" status --porcelain)" ]; then
+    echo "  ! $WDA_SRC has local changes — not needed (team + bundle id are passed by scripts/wda-resign)"
+  fi
+  ok "var/WebDriverAgent at $(git -C "$WDA_SRC" rev-parse --short HEAD)"
+fi
+
+echo "python venv (MCP SDK $MCP_SDK_VERSION)"
+if [ ! -x "$VAR_DIR/venv/bin/python" ]; then
+  python3 -m venv "$VAR_DIR/venv" || fail "python3 -m venv failed"
+fi
+if "$VAR_DIR/venv/bin/python" -c "import importlib.metadata as m, sys; sys.exit(m.version('mcp') != '$MCP_SDK_VERSION')" 2>/dev/null; then
+  ok "var/venv has mcp $MCP_SDK_VERSION"
+else
+  "$VAR_DIR/venv/bin/pip" install -q "mcp==$MCP_SDK_VERSION" >/dev/null 2>&1 \
+    && ok "installed mcp $MCP_SDK_VERSION into var/venv" || fail "pip install mcp==$MCP_SDK_VERSION failed"
+fi
+
+echo "ocr helper"
+if [ ! -x "$VAR_DIR/bin/ocr" ] || [ "$ROOT/tools/ocr.swift" -nt "$VAR_DIR/bin/ocr" ]; then
+  swiftc -O "$ROOT/tools/ocr.swift" -o "$VAR_DIR/bin/ocr" 2>/dev/null \
+    && ok "built var/bin/ocr (Apple Vision)" || fail "swiftc build of tools/ocr.swift failed"
+else
+  ok "var/bin/ocr up to date"
+fi
+
+if [ "$LINK" = 1 ]; then
+  echo "links"
+  for b in iphone-agent wda; do
+    if ln -sfn "$ROOT/bin/$b" "/usr/local/bin/$b" 2>/dev/null; then
+      ok "/usr/local/bin/$b → bin/$b"
+    else
+      fail "cannot write /usr/local/bin/$b (try: sudo ln -sfn $ROOT/bin/$b /usr/local/bin/$b)"
+    fi
+  done
+fi
+
+if [ "$MCP" = 1 ]; then
+  echo "MCP server 'iphone'"
+  if ! command -v claude >/dev/null 2>&1; then
+    fail "needs the claude CLI"
+  else
+    claude mcp remove iphone -s user >/dev/null 2>&1
+    claude mcp add -s user iphone -- "$ROOT/bin/iphone-mcp" >/dev/null \
+      && ok "registered 'iphone' (user scope) → bin/iphone-mcp; restart Claude Code to load it" \
+      || fail "claude mcp add failed"
+    claude mcp get mobile-mcp >/dev/null 2>&1 && echo "  ! mobile-mcp is still registered; remove it with: claude mcp remove mobile-mcp -s user"
+  fi
+fi
+
+cat <<EOF
+
+manual one-time steps (not scriptable):
+  Mac    Xcode → Settings → Accounts → add your Apple ID; put its Team ID in
+         config/iphone.env (DEVELOPMENT_TEAM) and pick a unique WDA_BUNDLE_PREFIX
+  phone  connect by USB, tap "Trust This Computer"
+  phone  Settings → Privacy & Security → Developer Mode → on (phone reboots)
+  Mac    scripts/wda-resign; on the first run the phone asks to trust the
+         developer certificate: Settings → General → VPN & Device Management
+  then   iphone-agent   (leave running) → bin/wda status
+EOF
+exit "$FAILED"

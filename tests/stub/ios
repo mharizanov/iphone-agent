@@ -1,0 +1,21 @@
+#!/bin/bash
+# stub go-ios for iphone-agent tests
+echo "$(date +%T) ios $*" >> "$STUBLOG"
+case "$1 $2" in
+  "list "*) echo "{\"deviceList\":[\"$IPHONE_UDID\"]}";;
+  "image auto") echo '{"msg":"ok"}';;
+  "kill --process=WebDriverAgentRunner-Runner") echo '{"level":"INFO","msg":"killed","process":"WebDriverAgentRunner-Runner"}';;
+  "tunnel start") exec python3 -c 'import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("127.0.0.1",60199));s.listen();time.sleep(99999)' ;;
+  "tunnel ls") echo '[{"udid":"x","userspaceTun":true,"userspaceTunPort":60199}]';;
+  "forward --udid") exec python3 -c '
+import http.server,os
+class H(http.server.BaseHTTPRequestHandler):
+  def log_message(s,*a): pass
+  def do_GET(s):
+    mode=open(os.environ["WDAMODE"]).read().strip() if os.path.exists(os.environ["WDAMODE"]) else "ok"
+    if mode=="hang": import time; time.sleep(30)
+    b=b"{\"value\":{\"ready\":true}}" if s.path=="/status" else (b"{\"value\":{\"error\":\"unable to perform\"}}" if mode=="zombie" else b"{\"value\":\"iVBORw0KGgo\"}")
+    s.send_response(200); s.end_headers(); s.wfile.write(b)
+http.server.ThreadingHTTPServer(("127.0.0.1",8100),H).serve_forever()' ;;
+  "runwda --udid") exec sleep 99999 ;;
+esac

@@ -1,0 +1,11 @@
+#!/bin/bash
+# iphone-mcp — stdio MCP server for the iPhone (logic in lib/iphone_mcp.py).
+# Registered in Claude Code by `scripts/setup --mcp`. stdout is the MCP
+# channel: nothing here may print to it. Logs: var/log/mcp.log.
+
+_self="$0"; while [ -L "$_self" ]; do _l="$(readlink "$_self")"
+  case "$_l" in /*) _self="$_l" ;; *) _self="$(dirname "$_self")/$_l" ;; esac; done
+. "$(dirname "$_self")/../lib/common.sh" >&2
+[ -x "$VAR_DIR/venv/bin/python" ] || { echo "no var/venv — run scripts/setup" >&2; exit 1; }
+export ROOT VAR_DIR WDA_URL WDA_MJPEG_PORT IOS_BIN IPHONE_MCP_EXTRA_RISKY
+exec "$VAR_DIR/venv/bin/python" "$ROOT/lib/iphone_mcp.py"
